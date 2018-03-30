@@ -50,6 +50,8 @@ import com.google.cloud.bigtable.grpc.async.ThrottlingClientInterceptor;
 import com.google.cloud.bigtable.grpc.io.ChannelPool;
 import com.google.cloud.bigtable.grpc.io.CredentialInterceptorCache;
 import com.google.cloud.bigtable.grpc.io.GoogleCloudResourcePrefixInterceptor;
+import com.google.cloud.bigtable.grpc.io.loadbalancer.LoadBalancer;
+import com.google.cloud.bigtable.grpc.io.loadbalancer.RoundRobinLoadBalancer;
 import com.google.cloud.bigtable.metrics.BigtableClientMetrics;
 import com.google.cloud.bigtable.metrics.BigtableClientMetrics.MetricLevel;
 import com.google.common.annotations.VisibleForTesting;
@@ -360,6 +362,15 @@ public class BigtableSession implements Closeable {
   }
 
   /**
+   * Creates a new {@link LoadBalancer.Factory} for selecting which channel to use for a request.
+   *
+   * @return a {@link LoadBalancer.Factory} object.
+   */
+  protected LoadBalancer.Factory<ManagedChannel> createLoadBalancerFactory() {
+    return new RoundRobinLoadBalancer.Factory<>();
+  }
+
+  /**
    * Create a new {@link com.google.cloud.bigtable.grpc.io.ChannelPool}, with auth headers.
    *
    * @param hostString a {@link java.lang.String} object.
@@ -373,7 +384,7 @@ public class BigtableSession implements Closeable {
         return createNettyChannel(hostString, options, clientInterceptors);
       }
     };
-    return new ChannelPool(channelFactory, count);
+    return new ChannelPool(channelFactory, count, createLoadBalancerFactory());
   }
 
   /**
@@ -416,6 +427,22 @@ public class BigtableSession implements Closeable {
    */
   public static ChannelPool createChannelPool(final String host, final BigtableOptions options, int count)
       throws IOException, GeneralSecurityException {
+    return createChannelPool(host, options, count, new RoundRobinLoadBalancer.Factory<ManagedChannel>());
+  }
+
+  /**
+   * Create a new {@link com.google.cloud.bigtable.grpc.io.ChannelPool}, with auth headers.
+   *
+   * @param host a {@link String} object specifying the host to connect to.
+   * @param options a {@link BigtableOptions} object with the credentials, retry and other connection options.
+   * @param count an int defining the number of channels to create
+   * @param loadBalancerFactory a {@link LoadBalancer.Factory} for selecting which channel to use for a request.
+   * @return a {@link ChannelPool} object.
+   * @throws IOException if any.
+   * @throws GeneralSecurityException
+   */
+  public static ChannelPool createChannelPool(final String host, final BigtableOptions options, int count, LoadBalancer.Factory<ManagedChannel> loadBalancerFactory)
+      throws IOException, GeneralSecurityException {
     final ClientInterceptor credentialsInterceptor = CredentialInterceptorCache.getInstance()
         .getCredentialsInterceptor(options.getCredentialOptions(), options.getRetryOptions());
     final ClientInterceptor prefixInterceptor =
@@ -426,7 +453,7 @@ public class BigtableSession implements Closeable {
           public ManagedChannel create() throws IOException {
             return createNettyChannel(host, options, credentialsInterceptor, prefixInterceptor);
           }
-        }, count);
+        }, count, loadBalancerFactory);
   }
 
   /**

@@ -21,6 +21,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.cloud.bigtable.config.Logger;
+import com.google.cloud.bigtable.grpc.io.loadbalancer.LoadBalancer;
+import com.google.cloud.bigtable.grpc.io.loadbalancer.RoundRobinLoadBalancer;
 import com.google.cloud.bigtable.metrics.BigtableClientMetrics;
 import com.google.cloud.bigtable.metrics.Counter;
 import com.google.cloud.bigtable.metrics.Meter;
@@ -33,6 +35,7 @@ import com.google.common.collect.ImmutableList;
 import io.grpc.CallOptions;
 import io.grpc.ClientCall;
 import io.grpc.ClientInterceptors.CheckedForwardingClientCall;
+import io.grpc.ForwardingClientCall;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.Metadata.Key;
@@ -227,11 +230,15 @@ public class ChannelPool extends ManagedChannel {
   }
 
   private final ImmutableList<ManagedChannel> channels;
-  private final AtomicInteger requestCount = new AtomicInteger();
   private final String authority;
 
   private boolean shutdown = false;
 
+  private final LoadBalancer<ManagedChannel> loadbalancer;
+
+  public ChannelPool(ChannelFactory factory, int count) throws IOException {
+    this(factory, count, new RoundRobinLoadBalancer.Factory<ManagedChannel>());
+  }
 
   /**
    * <p>Constructor for ChannelPool.</p>
@@ -239,7 +246,7 @@ public class ChannelPool extends ManagedChannel {
    * @param factory a {@link com.google.cloud.bigtable.grpc.io.ChannelPool.ChannelFactory} object.
    * @throws java.io.IOException if any.
    */
-  public ChannelPool(ChannelFactory factory, int count) throws IOException {
+  public ChannelPool(ChannelFactory factory, int count, LoadBalancer.Factory<ManagedChannel> loadBalancerFactory) throws IOException {
     Preconditions.checkArgument(count > 0, "Channel count has to be a positive number.");
     ImmutableList.Builder<ManagedChannel> channeListBuilder = ImmutableList.builder();
     for (int i = 0; i < count; i++) {
@@ -247,18 +254,7 @@ public class ChannelPool extends ManagedChannel {
     }
     this.channels = channeListBuilder.build();
     authority = channels.get(0).authority();
-  }
-
-  /**
-   * Performs a simple round robin on the list of {@link ManagedChannel}s in the {@code channels}
-   * list. This method should not be synchronized, if possible, to reduce bottlenecks.
-   *
-   * @return A {@link ManagedChannel} that can be used for a single RPC call.
-   */
-  private ManagedChannel getNextChannel() {
-    int currentRequestNum = requestCount.getAndIncrement();
-    int index = Math.abs(currentRequestNum % channels.size());
-    return channels.get(index);
+    this.loadbalancer = loadBalancerFactory.create(channels);
   }
 
   /** {@inheritDoc} */
@@ -270,7 +266,7 @@ public class ChannelPool extends ManagedChannel {
   /**
    * {@inheritDoc}
    * <P>
-   * Create a {@link ClientCall} on a Channel from the pool chosen in a round-robin fashion to the
+   * Create a {@link ClientCall} on a Channel from the pool to the
    * remote operation specified by the given {@link MethodDescriptor}. The returned
    * {@link ClientCall} does not trigger any remote behavior until
    * {@link ClientCall#start(ClientCall.Listener, io.grpc.Metadata)} is invoked.
@@ -279,7 +275,68 @@ public class ChannelPool extends ManagedChannel {
   public <ReqT, RespT> ClientCall<ReqT, RespT> newCall(
       MethodDescriptor<ReqT, RespT> methodDescriptor, CallOptions callOptions) {
     Preconditions.checkState(!shutdown, "Cannot perform operations on a closed connection");
-    return getNextChannel().newCall(methodDescriptor, callOptions);
+    LoadBalancer.Resource<ManagedChannel> resource = loadbalancer.next();
+    return new LoadBalancedClientCall<>(resource.get().newCall(methodDescriptor, callOptions), resource);
+  }
+
+  private static class LoadBalancedClientCall<ReqT, RespT> extends ForwardingClientCall<ReqT, RespT> {
+    private final LoadBalancer.Resource<ManagedChannel> resource;
+    private final AtomicBoolean completed = new AtomicBoolean();
+    private final ClientCall<ReqT, RespT> delegate;
+
+    private class ListenerWrapper extends Listener<RespT> {
+      private final Listener<RespT> delegate;
+
+      public ListenerWrapper(final Listener<RespT> delegate) {
+        this.delegate = delegate;
+      }
+
+      @Override
+      public void onClose(Status status, Metadata trailers) {
+        if (completed.compareAndSet(false, true)) {
+          resource.release();
+        }
+        delegate.onClose(status, trailers);
+      }
+
+      @Override
+      public void onHeaders(Metadata headers) {
+        delegate.onHeaders(headers);
+      }
+
+      @Override
+      public void onMessage(RespT message) {
+        delegate.onMessage(message);
+      }
+
+      @Override
+      public void onReady() {
+        delegate.onReady();
+      }
+    }
+
+    public LoadBalancedClientCall(ClientCall<ReqT, RespT> delegate, final LoadBalancer.Resource<ManagedChannel> resource) {
+      this.delegate = delegate;
+      this.resource = resource;
+    }
+
+    @Override
+    public void start(Listener<RespT> responseListener, Metadata headers) {
+      super.start(new ListenerWrapper(responseListener), headers);
+    }
+
+    @Override
+    protected ClientCall<ReqT, RespT> delegate() {
+      return delegate;
+    }
+
+    @Override
+    public void cancel(String message, Throwable cause) {
+      if (completed.compareAndSet(false, true)) {
+        resource.release();
+      }
+      super.cancel(message, cause);
+    }
   }
 
   /**
